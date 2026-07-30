@@ -1,0 +1,7 @@
+streamlit
+pdfplumber
+pymupdf
+python-docx
+scikit-learn
+pandas
+google-genai
