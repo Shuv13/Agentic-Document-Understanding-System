@@ -115,7 +115,7 @@ max_agent_turns = st.sidebar.slider(
 )
 
 agent_mode_active = bool(gemini_api_key) and genai is not None
-ANALYSIS_CACHE_VERSION = 5
+ANALYSIS_CACHE_VERSION = 6
 
 st.title("📄 Agentic Document Understanding System")
 st.write(
@@ -726,9 +726,31 @@ def generate_simple_summary(text, max_sentences=3):
                 score *= 0.35 ** boilerplate_hits
             scores.append(score)
 
-        top_indices = sorted(range(len(candidate_sentences)), key=lambda i: scores[i], reverse=True)
-        top_indices = top_indices[:max_sentences]
-        top_indices.sort()  # restore original reading order for coherence
+        # Greedy Maximal Marginal Relevance selection: pick the highest-scoring
+        # sentence first, then repeatedly pick whichever remaining sentence best
+        # balances its own score against similarity to what's already selected.
+        # Plain top-N by score tends to pick several near-duplicate sentences on
+        # documents that repeat the same core terminology throughout (e.g. every
+        # top sentence being about "the multi-agent architecture") — this spreads
+        # picks across different parts/aspects of the document instead.
+        max_score = max(scores) if scores else 0.0
+        normalized_scores = [s / max_score if max_score > 0 else 0.0 for s in scores]
+        similarity_matrix = cosine_similarity(tfidf_matrix)
+        mmr_lambda = 0.75  # weight toward relevance (1.0) vs. diversity (0.0)
+
+        selected_indices = []
+        remaining_indices = set(range(len(candidate_sentences)))
+        for _ in range(min(max_sentences, len(candidate_sentences))):
+            best_index, best_mmr_value = None, float("-inf")
+            for i in remaining_indices:
+                redundancy = max((similarity_matrix[i][j] for j in selected_indices), default=0.0)
+                mmr_value = mmr_lambda * normalized_scores[i] - (1 - mmr_lambda) * redundancy
+                if mmr_value > best_mmr_value:
+                    best_index, best_mmr_value = i, mmr_value
+            selected_indices.append(best_index)
+            remaining_indices.discard(best_index)
+
+        top_indices = sorted(selected_indices)  # restore original reading order for coherence
 
         return limit_summary_words(" ".join(format_summary_sentence(candidate_sentences[i]) for i in top_indices))
     except Exception:
