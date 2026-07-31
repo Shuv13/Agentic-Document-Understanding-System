@@ -115,7 +115,7 @@ max_agent_turns = st.sidebar.slider(
 )
 
 agent_mode_active = bool(gemini_api_key) and genai is not None
-ANALYSIS_CACHE_VERSION = 4
+ANALYSIS_CACHE_VERSION = 5
 
 st.title("📄 Agentic Document Understanding System")
 st.write(
@@ -273,6 +273,10 @@ def preprocess_text(text):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t\f\v]+", " ", text)
     text = re.sub(r" *\n+ *", "\n", text)
+    # Drop standalone page-number lines (e.g. a lone "16" from a page footer/header) —
+    # left in place, these glue onto the sentence or heading before/after them once
+    # newlines get collapsed during summarization, corrupting both.
+    text = re.sub(r"(?m)^\s*\d{1,4}\s*$\n?", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -428,6 +432,36 @@ def match_summary_heading(line):
     return None
 
 
+def looks_like_unrecognized_heading(line):
+    """
+    Detects short, title/caps-style lines that are almost certainly a section
+    heading even if it's not in our known heading list (e.g. "RESEARCH GAP",
+    "4.2 Testing Approach"). Used to end the current section's line-accumulation
+    at ANY heading boundary, not just recognized ones — otherwise an unrecognized
+    heading's line gets appended as body text, gluing it onto the surrounding
+    sentence and corrupting both.
+    """
+    stripped = line.strip()
+    if not stripped or stripped[-1] in ".!?,;:":
+        return False
+
+    words = stripped.split()
+    if not words or len(words) > 8:
+        return False
+
+    alpha_words = [w for w in words if re.search(r"[A-Za-z]", w)]
+    if not alpha_words:
+        return False
+
+    def is_heading_case(word):
+        letters = re.sub(r"[^A-Za-z]", "", word)
+        if not letters:
+            return True
+        return letters.isupper() or letters[0].isupper()
+
+    return all(is_heading_case(w) for w in alpha_words)
+
+
 def select_summary_source_text(text, max_words=1800):
     lines = [clean_summary_fragment(line) for line in text.splitlines()]
     sections = []
@@ -448,6 +482,14 @@ def select_summary_source_text(text, max_words=1800):
             flush_section()
             current_lines = []
             current_heading = heading
+            continue
+
+        if current_heading in SUMMARY_SOURCE_HEADINGS and looks_like_unrecognized_heading(line):
+            # An unrecognized heading (not in our whitelist) still ends the current
+            # section — otherwise its line gets glued onto the surrounding sentence.
+            flush_section()
+            current_lines = []
+            current_heading = None
             continue
 
         if current_heading in SUMMARY_SOURCE_HEADINGS:
@@ -481,6 +523,12 @@ def select_summary_source_text(text, max_words=1800):
     return "\n".join(selected) if selected else text
 
 
+DANGLING_END_WORDS = {
+    "and", "or", "but", "the", "a", "an", "of", "in", "on", "with", "to", "for",
+    "as", "by", "at", "from", "that", "which", "is", "are", "was", "were",
+}
+
+
 def looks_like_broken_pdf_fragment(fragment):
     words = fragment.split()
     if not words:
@@ -496,6 +544,10 @@ def looks_like_broken_pdf_fragment(fragment):
     if last and len(last) <= 2 and last.upper() not in {"ai", "ml", "ui"}:
         return True
     if re.search(r"\b[a-z]{1,2}\.$", fragment):
+        return True
+    if last in DANGLING_END_WORDS:
+        # A sentence that ends "...transparent, and." is truncated — a real
+        # sentence never legitimately ends on a bare connective/article.
         return True
 
     lower = fragment.lower()
@@ -560,8 +612,21 @@ def is_useful_summary_candidate(fragment):
     return True
 
 
+# Detects a page-break artifact glued mid-sentence: a PDF page's footer/header
+# (an optional page number followed by a short run of ALL-CAPS words, e.g. a
+# running section title like "RESEARCH GAP") that got extracted with no
+# punctuation separating it from the surrounding prose, because the original
+# sentence spanned a page boundary. Endpoint-only checks (first/last word of a
+# fragment) can't catch this since the artifact sits in the *middle* of an
+# otherwise clean-looking fragment — this forces a sentence break there instead.
+GENERIC_HEADING_INJECTION_PATTERN = re.compile(
+    r"(?<=[a-z0-9,;:\)])\s+(?:\d{1,3}\s+)?[A-Z]{2,}(?:\s+[A-Z]{2,}){1,4}(?=\s+[A-Z][a-z])"
+)
+
+
 def build_summary_candidates(text):
-    working = text
+    working = GENERIC_HEADING_INJECTION_PATTERN.sub(". ", text)
+
     for heading in SUMMARY_SECTION_BOUNDARIES:
         working = re.sub(
             rf"\s+({re.escape(heading)})\b",
