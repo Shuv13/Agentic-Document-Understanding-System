@@ -1,26 +1,13 @@
 """
 Agentic Document Understanding System
-======================================
 
-Architecture
-------------
-Instead of a fixed pipeline that always runs every analysis step in the
-same order, this version gives an LLM orchestrator a toolbox of functions
-(summarize, extract keywords, classify, evaluate, chunk long documents,
-compare documents, etc.) and lets it DECIDE which tools to call, in what
-order, and when to stop — using Google Gemini's native function/tool
-calling loop (via the google-genai SDK). Gemini has a generous free tier,
-so this runs without a paid API key.
+Uploads PDF/TXT/DOCX docs and analyzes them. With a Gemini API key, an LLM
+agent decides which analysis tools to run (summarize, extract keywords,
+classify, chunk, compare docs) instead of a fixed pipeline. Without a key,
+falls back to a deterministic rule-based pipeline.
 
-Every tool call the model makes is logged and shown to the user as an
-"Agent Trace", so you can see the reasoning path, not just the output.
-
-If no API key is provided, the app falls back to a deterministic
-rule-based pipeline (clearly labeled as fallback mode) so it still works
-without a key — it just isn't agentic in that mode.
-
-Install: pip install streamlit pdfplumber pymupdf python-docx scikit-learn pandas google-genai
-Run:     streamlit run app.py
+pip install streamlit pdfplumber pymupdf python-docx scikit-learn pandas google-genai
+streamlit run app.py
 """
 
 import re
@@ -158,13 +145,8 @@ with st.expander("ℹ️ How does the agent work?"):
 # -----------------------------
 
 def extract_page_text_column_aware(page):
-    """
-    pdfplumber's default extract_text() reads lines roughly top-to-bottom, which
-    scrambles two-column layouts (common in academic papers) by interleaving
-    fragments from both columns mid-sentence. This detects a likely two-column
-    layout and, if found, extracts the left column fully, then the right column,
-    instead of reading across both.
-    """
+    """pdfplumber reads lines top-to-bottom, which scrambles two-column layouts.
+    Detects two columns and extracts left column fully, then right column."""
     words = page.extract_words()
     if not words:
         return page.extract_text() or ""
@@ -206,12 +188,8 @@ def extract_text_from_pdf_pdfplumber(file):
 
 
 def extract_text_from_pdf(file):
-    # PyMuPDF's block-based reading-order algorithm handles complex layouts (title
-    # pages with multiple text boxes, tables, multi-column body text) far more
-    # reliably than pdfplumber's line-clustering approach, which can splice
-    # unrelated text fragments together mid-word/mid-sentence on such pages
-    # (e.g. cover pages with a title block, author list, and guide name positioned
-    # as separate text boxes rather than one flowing column).
+    # PyMuPDF handles complex layouts (title pages, tables, multi-column text)
+    # better than pdfplumber, which can splice unrelated fragments together.
     if fitz is not None:
         try:
             file_bytes = file.read()
@@ -273,9 +251,7 @@ def preprocess_text(text):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t\f\v]+", " ", text)
     text = re.sub(r" *\n+ *", "\n", text)
-    # Drop standalone page-number lines (e.g. a lone "16" from a page footer/header) —
-    # left in place, these glue onto the sentence or heading before/after them once
-    # newlines get collapsed during summarization, corrupting both.
+    # Drop standalone page-number lines so they don't glue onto nearby text.
     text = re.sub(r"(?m)^\s*\d{1,4}\s*$\n?", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -433,14 +409,8 @@ def match_summary_heading(line):
 
 
 def looks_like_unrecognized_heading(line):
-    """
-    Detects short, title/caps-style lines that are almost certainly a section
-    heading even if it's not in our known heading list (e.g. "RESEARCH GAP",
-    "4.2 Testing Approach"). Used to end the current section's line-accumulation
-    at ANY heading boundary, not just recognized ones — otherwise an unrecognized
-    heading's line gets appended as body text, gluing it onto the surrounding
-    sentence and corrupting both.
-    """
+    """Catches short title/caps-style lines that look like a heading even if
+    it's not in our known list, so it doesn't get glued onto body text."""
     stripped = line.strip()
     if not stripped or stripped[-1] in ".!?,;:":
         return False
@@ -485,8 +455,7 @@ def select_summary_source_text(text, max_words=1800):
             continue
 
         if current_heading in SUMMARY_SOURCE_HEADINGS and looks_like_unrecognized_heading(line):
-            # An unrecognized heading (not in our whitelist) still ends the current
-            # section — otherwise its line gets glued onto the surrounding sentence.
+            # unrecognized heading still ends the current section
             flush_section()
             current_lines = []
             current_heading = None
@@ -546,8 +515,7 @@ def looks_like_broken_pdf_fragment(fragment):
     if re.search(r"\b[a-z]{1,2}\.$", fragment):
         return True
     if last in DANGLING_END_WORDS:
-        # A sentence that ends "...transparent, and." is truncated — a real
-        # sentence never legitimately ends on a bare connective/article.
+        # ends on a bare connective/article -> truncated
         return True
 
     lower = fragment.lower()
@@ -612,13 +580,8 @@ def is_useful_summary_candidate(fragment):
     return True
 
 
-# Detects a page-break artifact glued mid-sentence: a PDF page's footer/header
-# (an optional page number followed by a short run of ALL-CAPS words, e.g. a
-# running section title like "RESEARCH GAP") that got extracted with no
-# punctuation separating it from the surrounding prose, because the original
-# sentence spanned a page boundary. Endpoint-only checks (first/last word of a
-# fragment) can't catch this since the artifact sits in the *middle* of an
-# otherwise clean-looking fragment — this forces a sentence break there instead.
+# Catches a page footer/header glued mid-sentence (page number + running
+# section title with no punctuation before it) and forces a sentence break.
 GENERIC_HEADING_INJECTION_PATTERN = re.compile(
     r"(?<=[a-z0-9,;:\)])\s+(?:\d{1,3}\s+)?[A-Z]{2,}(?:\s+[A-Z]{2,}){1,4}(?=\s+[A-Z][a-z])"
 )
@@ -706,10 +669,8 @@ def generate_simple_summary(text, max_sentences=3):
         return limit_summary_words(" ".join(format_summary_sentence(sentence) for sentence in candidate_sentences))
 
     try:
-        # Score each sentence by how information-dense it is (sum of TF-IDF weights
-        # of its words against the rest of the document), rather than just taking
-        # the first few sentences — this picks the most representative content
-        # from across the whole document, not just the introduction.
+        # Score sentences by how information-dense they are (TF-IDF weight),
+        # not just picking the first few.
         vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_df=0.95)
         tfidf_matrix = vectorizer.fit_transform(candidate_sentences)
         raw_scores = tfidf_matrix.sum(axis=1).A1
@@ -726,13 +687,9 @@ def generate_simple_summary(text, max_sentences=3):
                 score *= 0.35 ** boilerplate_hits
             scores.append(score)
 
-        # Greedy Maximal Marginal Relevance selection: pick the highest-scoring
-        # sentence first, then repeatedly pick whichever remaining sentence best
-        # balances its own score against similarity to what's already selected.
-        # Plain top-N by score tends to pick several near-duplicate sentences on
-        # documents that repeat the same core terminology throughout (e.g. every
-        # top sentence being about "the multi-agent architecture") — this spreads
-        # picks across different parts/aspects of the document instead.
+        # Greedy MMR selection: balance each pick's own score against similarity
+        # to what's already selected, so we don't end up with 3 near-duplicate
+        # sentences about the same topic.
         max_score = max(scores) if scores else 0.0
         normalized_scores = [s / max_score if max_score > 0 else 0.0 for s in scores]
         similarity_matrix = cosine_similarity(tfidf_matrix)
@@ -898,8 +855,7 @@ def calculate_similarity_matrix(documents):
 # AGENT ORCHESTRATOR
 # -----------------------------
 
-# Gemini function-declaration schemas (OpenAPI-subset dicts; type names are
-# uppercase per google.genai.types.Type).
+# Gemini function-declaration schemas (type names are uppercase per google.genai.types.Type)
 TOOL_DECLARATIONS_RAW = [
     {
         "name": "get_rule_based_summary",
@@ -1025,10 +981,7 @@ Do not call finalize_analysis until you have gathered enough information to be c
 
 
 def run_agent(client, model_name, doc_index, documents, max_turns):
-    """
-    Runs the tool-calling agent loop for documents[doc_index] using Gemini.
-    Returns (final_result_dict, trace_list).
-    """
+    """Runs the tool-calling agent loop for documents[doc_index]. Returns (result, trace)."""
     current_doc = documents[doc_index]
     text = current_doc["clean_text"]
     other_docs = {d["file_name"]: d["clean_text"] for i, d in enumerate(documents) if i != doc_index}
@@ -1106,7 +1059,7 @@ def run_agent(client, model_name, doc_index, documents, max_turns):
             trace.append({"step": turn + 1, "type": "message", "content": getattr(response, "text", "") or ""})
             break
 
-        # Echo the model's turn (including its function_call parts) back into the conversation.
+        # echo the model's turn back into the conversation
         contents.append(candidate.content)
 
         response_parts = []
@@ -1138,7 +1091,7 @@ def run_agent(client, model_name, doc_index, documents, max_turns):
             break
 
     if final_result is None:
-        # Agent ran out of turns without finalizing — build a safe fallback from whatever tools ran.
+        # ran out of turns without finalizing, build a safe fallback
         summary = generate_simple_summary(text)
         keywords = extract_keywords(text)
         category, _ = classify_document(text)
@@ -1157,9 +1110,8 @@ def run_agent(client, model_name, doc_index, documents, max_turns):
 
 
 def run_deterministic_pipeline(current_doc):
-    """Fallback path used when no API key / no google-genai package is available."""
+    """Fallback path when no API key is set."""
     text = current_doc["clean_text"]
-    # Keep fallback summaries concise while filtering noisy PDF boilerplate.
     summary_sentence_count = 3
     summary = generate_simple_summary(text, max_sentences=summary_sentence_count)
     keywords = extract_keywords(text)
@@ -1181,7 +1133,7 @@ def run_deterministic_pipeline(current_doc):
 # -----------------------------
 
 def build_search_index(processed_docs, chunk_size_words=200):
-    """Builds one TF-IDF index over chunks from ALL uploaded documents, for chat retrieval."""
+    """TF-IDF index over chunks from all uploaded documents, for chat retrieval."""
     chunks_meta = []
     for doc in processed_docs:
         chunks = chunk_text(doc["clean_text"], chunk_size_words)
@@ -1273,10 +1225,7 @@ chat, a normal text reply ends your turn."""
 
 
 def run_chat_agent(client, model_name, user_question, chat_contents, search_idx, processed_docs, max_turns):
-    """
-    Runs one turn of the document-chat agent. Mutates chat_contents in place (appends the
-    new turns) so conversation memory persists across calls. Returns (answer_text, trace).
-    """
+    """Runs one turn of the document-chat agent. Mutates chat_contents to keep memory."""
     trace = []
 
     def dispatch(name, args):
@@ -1423,8 +1372,7 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.success(f"{len(uploaded_files)} file(s) uploaded successfully.")
 
-    # Pass 1: extract & clean all documents up front so the agent can
-    # reference other documents (e.g. for comparison) while processing each one.
+    # extract & clean all docs up front so the agent can reference others for comparison
     documents = []
     for uploaded_file in uploaded_files:
         extracted_text = extract_text(uploaded_file)
@@ -1433,9 +1381,8 @@ if uploaded_files:
 
     client = genai.Client(api_key=gemini_api_key) if agent_mode_active else None
 
-    # Cache analysis + chat state in session_state, keyed on the uploaded fileset and
-    # settings, so re-running the (expensive) per-document agent pipeline only happens
-    # when the documents or mode actually change — not on every chat message.
+    # cache analysis in session_state so re-running the agent pipeline only
+    # happens when the docs or settings actually change, not on every chat message
     uploaded_signature = tuple((f.name, f.size) for f in uploaded_files)
     settings_changed = (
         st.session_state.get("doc_signature") != uploaded_signature
@@ -1492,9 +1439,7 @@ if uploaded_files:
     else:
         documents = st.session_state.processed_docs
 
-    # -----------------------------
-    # RENDER (always from cached results, never re-triggers the agent)
-    # -----------------------------
+    # ---- render (always from cached results) ----
 
     st.header("📌 Analysis Results")
 
