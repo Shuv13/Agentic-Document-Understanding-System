@@ -29,7 +29,7 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-streamlit run app.py
+streamlit run main.py
 ```
 
 ## Using agent mode (optional but recommended)
